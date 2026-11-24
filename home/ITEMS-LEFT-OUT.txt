@@ -1,0 +1,2 @@
+Missing from this .zip file, as the desktop listed them: the reason, then the path in the home folder, or the whole path on the desktop if it starts with /. ABOUT-THIS-ZIP.txt says more about each reason. A character that cannot be printed, and a backslash, is shown as \u and its code, and a long path ends in three dots.
+link: go

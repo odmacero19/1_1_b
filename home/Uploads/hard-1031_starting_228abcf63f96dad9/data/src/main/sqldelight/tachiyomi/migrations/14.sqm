@@ -1,0 +1,102 @@
+-- Real time incremental delta sync: outbox table + triggers that feed it.
+-- Existing rows are deliberately not back-filled; only changes made from now on are queued.
+
+-- Outbox of local changes that still have to be uploaded by the delta sync engine.
+--
+-- Rows are written by SQLite triggers (see mangas.sq, chapters.sq, mangas_categories.sq) whenever a
+-- row becomes dirty, i.e. whenever its `version` is bumped while `is_syncing = 0`.
+--
+-- Lifecycle of an entry:
+--   PENDING   -> waiting to be uploaded. At most ONE pending entry exists per (table_name, record_id),
+--                further changes to the same row are coalesced into it.
+--   IN_FLIGHT -> claimed by a push run. Deleted on acknowledgement, turned back into PENDING on failure.
+--   FAILED    -> parked after a permanent rejection / too many attempts. Re-queued by requeueFailed.
+CREATE TABLE sync_delta_queue(
+    _id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    table_name TEXT NOT NULL CHECK (table_name IN ('mangas', 'chapters')),
+    record_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'IN_FLIGHT', 'FAILED')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT
+);
+
+-- Coalesces repeated edits of the same row while it is waiting for upload.
+CREATE UNIQUE INDEX sync_delta_queue_pending_record_index
+ON sync_delta_queue(table_name, record_id)
+WHERE status = 'PENDING';
+
+CREATE INDEX sync_delta_queue_status_index
+ON sync_delta_queue(status, _id);
+
+DROP TRIGGER IF EXISTS update_manga_version;
+DROP TRIGGER IF EXISTS update_chapter_and_manga_version;
+DROP TRIGGER IF EXISTS insert_manga_category_update_version;
+DROP TRIGGER IF EXISTS delete_manga_category_update_version;
+
+-- A manga becomes dirty when a user-owned column changes while it is not being written by the sync engine
+-- (is_syncing = 0). The row is then version-bumped and queued for upload in sync_delta_queue.
+-- IS NOT (instead of !=) so that NULL <-> value transitions of description are detected as well.
+CREATE TRIGGER update_manga_version AFTER UPDATE ON mangas
+WHEN new.is_syncing = 0 AND (
+    new.url IS NOT old.url OR
+    new.description IS NOT old.description OR
+    new.favorite IS NOT old.favorite
+)
+BEGIN
+    UPDATE mangas SET version = version + 1
+    WHERE _id = new._id;
+
+    INSERT OR IGNORE INTO sync_delta_queue(table_name, record_id, status)
+    VALUES ('mangas', new._id, 'PENDING');
+END;
+
+-- A chapter becomes dirty when its reading state changes while it is not being written by the sync engine
+-- (is_syncing = 0). Chapter and owning manga are version-bumped and both are queued in sync_delta_queue.
+CREATE TRIGGER update_chapter_and_manga_version AFTER UPDATE ON chapters
+WHEN new.is_syncing = 0 AND (
+    new.read != old.read OR
+    new.bookmark != old.bookmark OR
+    new.last_page_read != old.last_page_read
+)
+BEGIN
+    -- Update the chapter version
+    UPDATE chapters SET version = version + 1
+    WHERE _id = new._id;
+
+    INSERT OR IGNORE INTO sync_delta_queue(table_name, record_id, status)
+    VALUES ('chapters', new._id, 'PENDING');
+
+    -- Update the manga version
+    UPDATE mangas SET version = version + 1
+    WHERE _id = new.manga_id AND (SELECT is_syncing FROM mangas WHERE _id = new.manga_id) = 0;
+
+    INSERT OR IGNORE INTO sync_delta_queue(table_name, record_id, status)
+    SELECT 'mangas', _id, 'PENDING'
+    FROM mangas
+    WHERE _id = new.manga_id AND is_syncing = 0;
+END;
+
+-- Category membership is part of the manga delta: adding or removing a category marks the manga dirty.
+CREATE TRIGGER insert_manga_category_update_version AFTER INSERT ON mangas_categories
+BEGIN
+    UPDATE mangas
+    SET version = version + 1
+    WHERE _id = new.manga_id AND (SELECT is_syncing FROM mangas WHERE _id = new.manga_id) = 0;
+
+    INSERT OR IGNORE INTO sync_delta_queue(table_name, record_id, status)
+    SELECT 'mangas', _id, 'PENDING'
+    FROM mangas
+    WHERE _id = new.manga_id AND is_syncing = 0;
+END;
+
+CREATE TRIGGER delete_manga_category_update_version AFTER DELETE ON mangas_categories
+BEGIN
+    UPDATE mangas
+    SET version = version + 1
+    WHERE _id = old.manga_id AND (SELECT is_syncing FROM mangas WHERE _id = old.manga_id) = 0;
+
+    INSERT OR IGNORE INTO sync_delta_queue(table_name, record_id, status)
+    SELECT 'mangas', _id, 'PENDING'
+    FROM mangas
+    WHERE _id = old.manga_id AND is_syncing = 0;
+END;
